@@ -1,0 +1,15 @@
+# The build context is the project folder, and `ADD * /code/` in the Dockerfile
+# uses Go-style globbing, where `*` matches dotfiles too. Without this file the
+# local virtualenv gets swept into the image, and its python symlinks point at
+# the uv toolchain outside the build context, so the build fails with
+#   failed to calculate checksum of ref ...: "/.venv/bin/python": not found
+.venv/
+.venv
+
+# Local-only helpers and junk that have no business in the scoring image.
+__pycache__/
+*.pyc
+.DS_Store
+requirements.txt
+local_eval.py
+extended_evaluation.pdf

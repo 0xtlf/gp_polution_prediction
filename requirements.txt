@@ -1,0 +1,15 @@
+# Local dev environment (macOS/arm64, Python 3.8) -- NOT the graded environment.
+# The checker runs the Docker image built from env.yaml + Dockerfile; these pins
+# only need to make solution.py runnable on this machine. Four of env.yaml's pins
+# cannot be honoured here:
+#   cryptography 3.0   no arm64 wheel; source build fails against OpenSSL 3.x
+#   matplotlib   3.4.* no arm64 wheel; bundled freetype build fails
+#   numpy        1.21.* arm64 wheel's OpenBLAS segfaults on matmul (SIGSEGV)
+#   scipy        1.7.*  arm64 wheel's OpenBLAS segfaults in linalg.cholesky (SIGBUS)
+# numpy 1.24.4 and scipy 1.10.1 are the last releases supporting Python 3.8.
+numpy==1.24.4
+scipy==1.10.1
+pyarmor==6.7.4
+cryptography
+scikit-learn==1.3.0
+matplotlib==3.7.*
