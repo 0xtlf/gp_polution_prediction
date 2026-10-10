@@ -33,8 +33,8 @@ $$
 with $c = 0.35$, so a point on a cluster edge still has data beyond it. Sets larger
 than 1500 points are subsampled, keeping members over halo points.
 
-**2. Fit.** Each cluster gets an independent GP with a Matérn-$5/2$ kernel, where
-$d = \|x - x'\|$:
+**2. Fit.** Each cluster gets an independent GP with a Matérn kernel of smoothness
+$\nu = \frac{5}{2}$, where $d = \|x - x'\|$:
 
 $$
 k(x, x') = \sigma^2 \left( 1 + \frac{d\sqrt{5}}{\ell} + \frac{5 d^2}{3 \ell^2} \right)
@@ -43,8 +43,8 @@ $$
 
 The triple $(\sigma, \ell, \sigma_n)$ is fitted per cluster by maximising the log
 marginal likelihood, letting each region adapt its own amplitude and noise level.
-Matérn-$5/2$ is used because the field is rougher than a squared-exponential kernel
-can represent, and smoother than Matérn-$3/2$ assumes.
+This $\nu$ is used because the field is rougher than a squared-exponential kernel
+can represent, and smoother than $\nu = \frac{3}{2}$ assumes.
 
 **3. Predict.** A test point is routed to its nearest centroid, yielding a posterior
 mean $\mu(x)$ and standard deviation $s(x)$, with $s^2 = s_f^2 + \sigma_n^2$ for
