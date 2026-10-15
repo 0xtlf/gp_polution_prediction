@@ -1,14 +1,13 @@
 import os
 import time
 import typing
-from sklearn.gaussian_process.kernels import *
+from sklearn.gaussian_process.kernels import ConstantKernel, Kernel, Matern, WhiteKernel
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.cluster import KMeans
 from scipy.optimize import brentq
 from scipy.stats import norm
 import matplotlib.pyplot as plt
-from matplotlib import cm
 
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
@@ -19,16 +18,14 @@ EVALUATION_GRID_POINTS = 300  # Number of grid points used in extended evaluatio
 COST_W_UNDERPREDICT = 50.0
 COST_W_NORMAL = 1.0
 
-# Local-GP approximation. k-means partitions the map; one GP is fitted per cluster,
-# on its own members plus a halo reaching CLUSTER_OVERLAP * cluster_radius past the
-# cluster edge. MAX_POINTS_PER_CLUSTER caps the cubic cost; excess is subsampled,
-# preferring a cluster's own members over halo points.
+# Local-GP approximation. k-means partitions the map; one GP fitted per cluster,
+# on its own members plus a halo reaching CLUSTER_OVERLAP * cluster_radius past the edge.
+# MAX_POINTS_PER_CLUSTER caps the cluster size
 N_CLUSTERS = 85
 CLUSTER_OVERLAP = 0.35
 MAX_POINTS_PER_CLUSTER = 1500
 
-# Matern(nu=5/2) kernel. These are starting values: every cluster fits its own
-# length scale, amplitude and noise by maximizing the log marginal likelihood.
+# Matern(nu=5/2) kernel + Optimiser configuration
 LENGTH_SCALE = 0.033
 LENGTH_SCALE_BOUNDS = (1e-2, 1e0)
 NOISE_LEVEL = 0.01
@@ -36,9 +33,9 @@ NOISE_LEVEL_BOUNDS = (1e-3, 1e3)
 N_RESTARTS_OPTIMIZER = 5
 
 # Fraction of the fitted noise variance that counts towards the safety margin.
-# predict() returns the stddev of a noisy observation, but the test targets are
-# noiseless, so only part of that noise is worth insuring against. Calibrated
-# against the checker; the expected-cost curve is flat between 0.35 and 0.50.
+# gp_stddev = uncertainty_f^2 + sigma_n^2
+# during residential area prediction on unnoised data, we keep only a NOISE_IN_MARGIN fraction of sigma_n^2
+# i.e we upscale our predictions by const * sqrt(max(uncertainty_f^2 - (1 - NOISE_IN_MARGIN) * sigma_n^2, 0))
 NOISE_IN_MARGIN = 0.45
 
 # Per-cluster progress logging. Run with `python -u` to stream it.
@@ -51,7 +48,12 @@ def _log(message: str):
 
 
 def _build_kernel() -> Kernel:
-    """A fresh kernel, so each cluster's hyperparameters stay independent."""
+    """
+    Kernel structure: constant * spatial_signal + measurement_noise
+    spatial_signal: Matern over RBF, since RBF smooths too much
+    measurement_noise: training data is noisy, test data is not.
+                    Used to discount noise in safety margin
+    """
     return ConstantKernel(
         constant_value=1.0, constant_value_bounds=(1e-3, 1e3)
     ) * Matern(
@@ -66,16 +68,18 @@ def _optimal_std_offset(
     """
     Standard deviations to shift a prediction upwards to minimize the asymmetric cost.
 
-    For f(x) ~ N(mu, sigma^2) and a prediction mu + z * sigma, the expected weighted
-    loss is sigma^2 * (w * A(z) + B(z)) where, for t ~ N(0, 1),
-
-        A(z) = E[(t-z)^2; t >= z] = (1 + z^2) * (1 - Phi(z)) - z * phi(z)
-        B(z) = E[(t-z)^2; t <  z] = (1 + z^2) * Phi(z)       + z * phi(z)
-
-    The optimum is the root of w * A'(z) + B'(z) = 0, the condition below. sigma^2
-    factors out, so it is a single constant for the whole map: 1.4852 for w = 50,
-    which leaves a 6.9% chance of underpredicting. The loss is convex in z, so the
-    root is unique.
+    For f(x) | D following N(mu, sigma^2), a prediction f_pred = mu + z * sigma, the loss is
+        - (f - f_pred)^2 if f_pred > f
+        - w(f - f_pred)^2 if f_pred <= f
+    Let t = (f - mu)/sigma. Then , the following
+        - f_pred > f = t < z
+        - f_pred f <= t >= z
+    Therefore
+        F(z) = E[loss]/sigma^2 = w E[(t-z)^2 1(t≥z)] + E[(t-z)^2 1(t<z)] = wA(z) + B(z)
+    One can then show that
+        F'(z) = 2z[w(1-Phi(z)) + Phi(z)] - 2(w-1)phi(z)
+    where Phi is the standard normal cdf and phi the pdf.
+    We find the local minimum of F which is global and unique by convexity
     """
 
     def stationarity(z: float) -> float:
@@ -160,8 +164,7 @@ class Model(object):
         self.fallback_mean = float(targets.mean())
         self.fallback_std = float(targets.std())
 
-        # The residential flags do not enter the GP: the task's asymmetry lives in the
-        # cost, not in the data, and the flags add nothing to the coordinates.
+        # The residential flags do not enter the GP
         started = time.time()
         n_clusters = min(N_CLUSTERS, coordinates.shape[0])
         self.kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=0)
@@ -172,11 +175,12 @@ class Model(object):
             f"(margin {self.residential_std_offset:.4f} stddevs)"
         )
 
-        self.cluster_gps = []
-        self.cluster_noise_var = []
+        self.cluster_gps = []  # One GP per cluster
+        self.cluster_noise_var = []  # Fitted noise variance, from WhiteKernel noise level
         for cluster_index in range(n_clusters):
             indices = self._training_indices(cluster_index, coordinates, labels)
             if indices.size < 2:
+                # Too little data to fit a GP
                 self.cluster_gps.append(None)
                 self.cluster_noise_var.append(0.0)
                 continue
@@ -184,7 +188,7 @@ class Model(object):
             cluster_started = time.time()
             gp = GaussianProcessRegressor(
                 kernel=_build_kernel(),
-                normalize_y=True,  # the targets average ~33, the GP prior is zero-mean
+                normalize_y=True,
                 n_restarts_optimizer=N_RESTARTS_OPTIMIZER,
                 random_state=0,
             ).fit(coordinates[indices], targets[indices])
@@ -240,13 +244,14 @@ class Model(object):
             )
             noise_var[batch] = self.cluster_noise_var[cluster_index]
 
-        # Outside residential areas the cost is a plain squared error, so the posterior
-        # mean is optimal. Inside them underprediction costs 50x, so shift upwards by
-        # the cost-minimizing number of stddevs. gp_std is returned unmodified.
+        # Outside residential areas the cost is a squared error, so the posterior
+        # mean is optimal. Inside residential areas underprediction costs 50x, so shift upwards by
+        # the cost-minimizing number of stddevs.
         margin_std = np.sqrt(
             np.maximum(gp_std**2 - (1.0 - NOISE_IN_MARGIN) * noise_var, 0.0)
         )
         predictions = gp_mean.copy()
+        # Add the safety margin to residential areas
         predictions[residential] += (
             self.residential_std_offset * margin_std[residential]
         )
@@ -383,7 +388,7 @@ def perform_extended_model_evaluation(model: Model, output_dir: str = "/results"
     fig, ax = plt.subplots()
     ax.set_title("Extended visualization of task 1")
     im = ax.imshow(predictions, vmin=vmin, vmax=vmax)
-    cbar = fig.colorbar(im, ax=ax)
+    fig.colorbar(im, ax=ax)
 
     # Save figure to pdf
     figure_path = os.path.join(output_dir, "extended_evaluation.pdf")
